@@ -75,7 +75,7 @@ def httpx_retry_client() -> httpx.AsyncClient:
 def httpx_file_client() -> httpx.AsyncClient:
     # verify: Union[str, bool, ssl.SSLContext] = True
     transport = RetryTransport(
-        max_attempts=3,
+        max_attempts=1,
         backoff_factor=0.1,
         retry_status_codes=[408, 429, 500, 502, 503, 504],
         retryable_methods=["PUT"],
@@ -150,10 +150,11 @@ class ClientManager:
 
     # files
 
-    async def upload_file(self, fh: io.IOBase, url: Optional[str]) -> str:
+    async def upload_file(
+        self, fh: io.IOBase, *, url: Optional[str], prediction_id: Optional[str]
+    ) -> str:
         """put file to signed endpoint"""
         log.debug("upload_file")
-        fh.seek(0)
         # try to guess the filename of the given object
         name = getattr(fh, "name", "file")
         filename = os.path.basename(name) or "file"
@@ -172,6 +173,7 @@ class ClientManager:
         url_with_trailing_slash = url if url.endswith("/") else url + "/"
 
         async def chunk_file_reader() -> AsyncIterator[bytes]:
+            fh.seek(0)
             while 1:
                 chunk = fh.read(1024 * 1024)
                 if isinstance(chunk, str):
@@ -182,6 +184,11 @@ class ClientManager:
                 yield chunk
 
         url = url_with_trailing_slash + filename
+
+        headers = {"Content-Type": content_type}
+        if prediction_id is not None:
+            headers["X-Prediction-ID"] = prediction_id
+
         # this is a somewhat unfortunate hack, but it works
         # and is critical for upload training/quantization outputs
         # if we get multipart uploads working or a separate API route
@@ -191,29 +198,36 @@ class ClientManager:
             resp1 = await self.file_client.put(
                 url,
                 content=b"",
-                headers={"Content-Type": content_type},
+                headers=headers,
                 follow_redirects=False,
             )
             if resp1.status_code == 307 and resp1.headers["Location"]:
                 log.info("got file upload redirect from api")
                 url = resp1.headers["Location"]
+
         log.info("doing real upload to %s", url)
         resp = await self.file_client.put(
             url,
             content=chunk_file_reader(),
-            headers={"Content-Type": content_type},
+            headers=headers,
         )
         # TODO: if file size is >1MB, show upload throughput
         resp.raise_for_status()
 
-        # strip any signing gubbins from the URL
-        final_url = urlparse(str(resp.url))._replace(query="").geturl()
+        # Try to extract the final asset URL from the `Location` header
+        # otherwise fallback to the URL of the final request.
+        final_url = str(resp.url)
+        if "location" in resp.headers:
+            final_url = resp.headers.get("location")
 
-        return final_url
+        # strip any signing gubbins from the URL
+        return urlparse(final_url)._replace(query="").geturl()
 
     # this previously lived in json.upload_files, but it's clearer here
     # this is a great pattern that should be adopted for input files
-    async def upload_files(self, obj: Any, url: Optional[str]) -> Any:
+    async def upload_files(
+        self, obj: Any, *, url: Optional[str], prediction_id: Optional[str]
+    ) -> Any:
         """
         Iterates through an object from make_encodeable and uploads any files.
         When a file is encountered, it will be passed to upload_file. Any paths will be opened and converted to files.
@@ -228,15 +242,21 @@ class ClientManager:
         # TODO: upload concurrently
         if isinstance(obj, dict):
             return {
-                key: await self.upload_files(value, url) for key, value in obj.items()
+                key: await self.upload_files(
+                    value, url=url, prediction_id=prediction_id
+                )
+                for key, value in obj.items()
             }
         if isinstance(obj, list):
-            return [await self.upload_files(value, url) for value in obj]
+            return [
+                await self.upload_files(value, url=url, prediction_id=prediction_id)
+                for value in obj
+            ]
         if isinstance(obj, Path):
             with obj.open("rb") as f:
-                return await self.upload_file(f, url)
+                return await self.upload_file(f, url=url, prediction_id=prediction_id)
         if isinstance(obj, io.IOBase):
-            return await self.upload_file(obj, url)
+            return await self.upload_file(obj, url=url, prediction_id=prediction_id)
         return obj
 
     # inputs
